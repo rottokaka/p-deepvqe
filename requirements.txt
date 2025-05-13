@@ -7,3 +7,8 @@ ptflops==0.7
 torch==1.11.0
 tqdm
 hydra-core
+torchmetrics
+librosa
+onnxruntime
+requests
+torchaudio
