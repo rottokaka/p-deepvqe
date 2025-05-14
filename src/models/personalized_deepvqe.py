@@ -1,3 +1,9 @@
+# ------------------------------------------------------------------------
+# Modified from DeepVQE (https://github.com/Xiaobin-Rong/deepvqe.git)
+# Copyright (c) 2025 Rong Xiaobin. All Rights Reserved.
+# Licensed under the MIT License.
+# ------------------------------------------------------------------------
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -28,7 +34,25 @@ class ResidualBlock(nn.Module):
         y = self.elu(self.bn(self.conv(self.pad(x))))
         return y + x
     
+
+class InvertedResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels//2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels//2),
+            nn.ZeroPad2d([1, 1, 3, 0]),
+            nn.Conv2d(channels//2, channels//2, kernel_size=(4,3)),
+            nn.BatchNorm2d(channels//2),
+            nn.Hardswish(),
+            nn.Conv2d(channels//2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
         
+
 class AlignBlock(nn.Module):
     def __init__(self, in_channels, hidden_channels, delay=100):
         super().__init__()
@@ -67,24 +91,40 @@ class EncoderBlock(nn.Module):
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride)
         self.bn = nn.BatchNorm2d(out_channels)
         self.elu = nn.ELU()
-        self.resblock = ResidualBlock(out_channels)
+        self.invresblock = InvertedResidualBlock(out_channels)
     def forward(self, x):
-        return self.resblock(self.elu(self.bn(self.conv(self.pad(x)))))
+        return self.invresblock(self.elu(self.bn(self.conv(self.pad(x)))))
 
 
 class Bottleneck(nn.Module):
     def __init__(self, input_size, hidden_size):
         super().__init__()
-        self.gru = nn.GRU(input_size, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, input_size)
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=2, batch_first=True)
+        self.ln1 = nn.LayerNorm(input_size)
+        self.ln2 = nn.LayerNorm(hidden_size)
+        self.fc1 = nn.Linear(input_size+hidden_size, input_size)
+        self.fc2 = nn.Linear(hidden_size, input_size)
         
-    def forward(self, x):
+    def forward(self, x, e = None):
         """x : (B,C,T,F)"""
         y = rearrange(x, 'b c t f -> b t (c f)')
+        y = self.ln1(y)
+        if e == None:
+            e = torch.zeros(list(y.shape[:-1])+[self.hidden_size])
+        # print(y.shape, e.shape)
+        y = torch.cat([y, e.expand(-1, y.shape[1], -1)], dim=-1)
+        y = self.fc1(y)
         y = self.gru(y)[0]
-        y = self.fc(y)
+        y = self.ln2(y)
+
+        # internal embedding
+        e = torch.mean(y, dim=1, keepdim=True)
+
+        y = self.fc2(y)
         y = rearrange(y, 'b t (c f) -> b c t f', c=x.shape[1])
-        return y
+        return e, y
     
 
 class SubpixelConv2d(nn.Module):
@@ -146,8 +186,17 @@ class PersonalizedDeepVQE(nn.Module):
     def __init__(self):
         super().__init__()
         self.fe = FE()
-        self.enblock1 = EncoderBlock(2, 64)
-        self.enblock2 = EncoderBlock(64, 128)
+
+        # mic signal
+        self.enblock1_mic = EncoderBlock(2, 64)
+        self.enblock2_mic = EncoderBlock(64, 128)
+
+        # far end signal
+        self.enblock1_ref = EncoderBlock(2, 64)
+        self.enblock2_ref = EncoderBlock(64, 128)
+
+        self.alignblock = AlignBlock(128, 128)
+
         self.enblock3 = EncoderBlock(128, 128)
         self.enblock4 = EncoderBlock(128, 128)
         self.enblock5 = EncoderBlock(128, 128)
@@ -161,38 +210,77 @@ class PersonalizedDeepVQE(nn.Module):
         self.deblock1 = DecoderBlock(64, 27)
         self.ccm = CCM()
         
-    def forward(self, x):
+    def forward(self, x_enr, x_mic, x_ref=None):
         """x: (B,F,T,2)"""
-        en_x0 = self.fe(x)            # ; print(en_x0.shape)
-        en_x1 = self.enblock1(en_x0)  # ; print(en_x1.shape)
-        en_x2 = self.enblock2(en_x1)  # ; print(en_x2.shape)
+        if x_ref is None:
+            x_ref = torch.zeros_like(x_mic)
+
+        # enrollment signal
+        en_x0_enr = self.fe(x_enr)        # ; print(en_x0.shape)
+        en_x1_enr = self.enblock1_mic(en_x0_enr)  # ; print(en_x1.shape)
+        en_x2_enr = self.enblock2_mic(en_x1_enr)  # ; print(en_x2.shape)
+
+        x_enrr = torch.zeros_like(x_enr)
+        en_x0_enrr = self.fe(x_enrr)        # ; print(en_x0.shape)
+        en_x1_enrr = self.enblock1_mic(en_x0_enrr)  # ; print(en_x1.shape)
+        en_x2_enrr = self.enblock2_mic(en_x1_enrr)  # ; print(en_x2.shape)
+
+        en_x2_e = self.alignblock(en_x2_enr, en_x2_enrr)
+
+        en_x3_e = self.enblock3(en_x2_e)  # ; print(en_x3.shape)
+        en_x4_e = self.enblock4(en_x3_e)  # ; print(en_x4.shape)
+        en_x5_e = self.enblock5(en_x4_e)  # ; print(en_x5.shape)
+
+        e, _ = self.bottle(en_x5_e)
+
+
+        # mic signal
+        en_x0_mic = self.fe(x_mic)        # ; print(en_x0.shape)
+        en_x1_mic = self.enblock1_mic(en_x0_mic)  # ; print(en_x1.shape)
+        en_x2_mic = self.enblock2_mic(en_x1_mic)  # ; print(en_x2.shape)
+
+        # far end signal
+        en_x0_ref = self.fe(x_ref)        # ; print(en_x0.shape)
+        en_x1_ref = self.enblock1_ref(en_x0_ref)  # ; print(en_x1.shape)
+        en_x2_ref = self.enblock2_ref(en_x1_ref)  # ; print(en_x2.shape)
+
+        en_x2 = self.alignblock(en_x2_mic, en_x2_ref)
+
         en_x3 = self.enblock3(en_x2)  # ; print(en_x3.shape)
         en_x4 = self.enblock4(en_x3)  # ; print(en_x4.shape)
         en_x5 = self.enblock5(en_x4)  # ; print(en_x5.shape)
 
-        en_xr = self.bottle(en_x5)    # ; print(en_xr.shape)
+        _, en_xr = self.bottle(en_x5, e)    # ; print(en_xr.shape)
         
         de_x5 = self.deblock5(en_xr, en_x5)[..., :en_x4.shape[-1]]  # ; print(de_x5.shape)
         de_x4 = self.deblock4(de_x5, en_x4)[..., :en_x3.shape[-1]]  # ; print(de_x4.shape)
         de_x3 = self.deblock3(de_x4, en_x3)[..., :en_x2.shape[-1]]  # ; print(de_x3.shape)
-        de_x2 = self.deblock2(de_x3, en_x2)[..., :en_x1.shape[-1]]  # ; print(de_x2.shape)
-        de_x1 = self.deblock1(de_x2, en_x1)[..., :en_x0.shape[-1]]  # ; print(de_x1.shape)
+        de_x2 = self.deblock2(de_x3, en_x2)[..., :en_x1_mic.shape[-1]]  # ; print(de_x2.shape)
+        de_x1 = self.deblock1(de_x2, en_x1_mic)[..., :en_x0_mic.shape[-1]]  # ; print(de_x1.shape)
         
-        x_enh = self.ccm(de_x1, x)  # (B,F,T,2)
+        x_enh = self.ccm(de_x1, x_mic)  # (B,F,T,2)
         
         return x_enh
 
 def build(cfg):
     pass
 
+def input_constructor(input_res):
+    # input_res is just a placeholder, e.g., (3, 224, 224)
+    x1 = torch.randn(1, 257, 100, 2)
+    x2 = torch.randn(1, 257, 100, 2)  # e.g., an auxiliary vector input
+    x3 = torch.randn(1, 257, 80, 2)
+    return dict(x_mic=x1, x_ref=x2, x_enr=x3)  # or return (x1, x2) depending on model
+
 if __name__ == "__main__":
-    model = DeepVQE().eval()
+    model = PersonalizedDeepVQE().eval()
     x = torch.randn(1, 257, 63, 2)
-    y = model(x)
+    y = model(x, x)
 
     
     from ptflops import get_model_complexity_info
     flops, params = get_model_complexity_info(model, (257, 63, 2), as_strings=True,
+                                           input_constructor=input_constructor,
                                            print_per_layer_stat=False, verbose=True)
     print(flops, params)
 
@@ -202,7 +290,7 @@ if __name__ == "__main__":
     c = torch.randn(1, 257, 100, 2)
     x1 = torch.cat([a, b], dim=2)
     x2 = torch.cat([a, c], dim=2)
-    y1 = model(x1)
-    y2 = model(x2)
+    y1 = model(x1, x2)
+    y2 = model(x2, x1)
     print((y1[:,:,:100,:] - y2[:,:,:100,:]).abs().max())
     print((y1[:,:,100:,:] - y2[:,:,100:,:]).abs().max())

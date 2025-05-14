@@ -1,3 +1,9 @@
+# ------------------------------------------------------------------------
+# Modified from DeepVQE (https://github.com/Xiaobin-Rong/deepvqe.git)
+# Copyright (c) 2025 Rong Xiaobin. All Rights Reserved.
+# Licensed under the MIT License.
+# ------------------------------------------------------------------------
+
 import torch
 import torch.nn as nn
 import numpy as np
