@@ -2,3 +2,7 @@ data/
 ckpts/
 venv/
 *.ipynb
+**/*_old.*
+__pycache__/
+*.py[cod]
+*$py.class

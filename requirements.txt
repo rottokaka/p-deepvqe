@@ -4,12 +4,14 @@ onnx==1.14.1
 onnxruntime==1.16.1
 onnxsim==0.4.33
 ptflops==0.7
-torch==1.11.0
 tqdm
 hydra-core
 torchmetrics
 librosa
-onnxruntime
 requests
-torchaudio
 soundfile
+lightning
+--extra-index-url https://download.pytorch.org/whl/cu117
+torch==1.13.0+cu117
+torchaudio
+pandas
