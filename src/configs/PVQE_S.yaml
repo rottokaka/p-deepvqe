@@ -1,27 +1,68 @@
 hydra:
   run:
-    dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 datasets:
-  name: Emilia_ZH_EN  # dataset name
-  batch_size_per_gpu: 38400  # 8 GPUs, 8 * 38400 = 307200
-  batch_size_type: frame  # frame | sample
-  max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
-  num_workers: 16
+  name: AEC  # dataset name
+  metadata_train: null
+  metadata_val: null
+  metadata_test: null
+  metadata_infer: null
+  batch_size_per_gpu: 64
+  num_workers: 32
+  augment:
+    max_snr: 15 # highest SNR when mixing near end and far end signal
+    min_snr: -5 # lowest SNR when mixing near end and far end signal
+    white_noise_rate: 0.1
+    max_aug_snr: 20
+    min_aug_snr: 3
+    specaugment_rate: 0.15 # only apply on enrollment audio
+    n_time_masks: 2
+    time_mask_param: 10
+    n_freq_masks: 2
+    freq_mask_param: 25
+    
+  feat:
+    target_sample_rate: 16000
+    hop_length: 160
+    win_length: 320
+    n_fft: 480
+    window_fn: Hann # Hann | Hamming
+    c: 0.3 # compression exponent
 
 optim:
-  epochs: 11
-  learning_rate: 7.5e-5
-  num_warmup_updates: 20000  # warmup updates
-  grad_accumulation_steps: 1  # note: updates = steps / grad_accumulation_steps
+  epochs: 20
+  learning_rate: 6e-5
   max_grad_norm: 1.0  # gradient clipping
-  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
+  optimizer: Adam # Adam | AdamW | SGD
+  decay: 1e-7
 
 model:
   name: PVQE_S
+  arch:
+    enc:
+      kernel_size: [4, 3]
+
+      # number of filter in each branch
+      mic: [16, 40] # mic branch
+      ref: [8, 24]  # far end branch
+      mix: [56, 24] # combined branch
+
+      delay: 100 # maximum echo delay in the alignment block
+      
+      n_fft: 480 # number of frequency bin
+
+    bottle_neck:
+      dim: 256 # hidden dimension of temporal block (GRU)
+
+    dec: [40, 32, 32, 27] # number of filter in the inverted residual blocks
+
+  loss_func:
+    c: 0.3 # should be equal as above
+    beta: 0.7
 
 ckpts:
-  logger: wandb  # wandb | tensorboard | null
+  logger: null  # tensorboard | null
   log_samples: True  # infer random sample per save checkpoint. wip, normal to fail with extra long samples
   save_per_updates: 50000  # save checkpoint per updates
   keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
