@@ -66,6 +66,13 @@ class AECRealDataset(Dataset):
         assert enrl_sr == nearend_mic_sr == farend_mic_sr == farend_lpb_sr == self.config.feat.target_sample_rate
 
         mic_sig, target_sig = self._mix_signal(nearend_mic_sig, farend_mic_sig)
+
+        diff = mic_sig.shape[1]-farend_lpb_sig.shape[1]
+        if diff > 0:
+            farend_lpb_sig = self._pad(farend_lpb_sig, diff, False)
+        elif diff < 0:
+            mic_sig = self._pad(mic_sig, -diff, False)
+
         rate = random.uniform(0, 1)
         if rate <= self.config.augment.white_noise_rate:
             mic_sig = self._add_white_noise(mic_sig)
@@ -190,9 +197,9 @@ def collate_fn(batch):
     all_data = [[], [], [], []] # enrl, mic, farend_lpb, target
     all_length = [[], [], [], []]
     for item in batch:
-        for idx in range((len(item["data"]))):
+        for idx in range(len(item["data"])):
             all_data[idx].append(item["data"][idx])
-        for idx in range((len(item["length"]))):
+        for idx in range(len(item["length"])):
             all_length[idx].append(item["length"][idx])
 
     for idx in range(len(all_data)):
@@ -200,8 +207,8 @@ def collate_fn(batch):
         all_data[idx] = torch.concatenate([
             nn.functional.pad(t, (0, 0, max_length-t.shape[2], 0)) # t.shape = [B, F, T, 2]
             for t in all_data[idx]
-        ], dim=0)
-        all_length[idx] = torch.stack(all_length[idx], dim=0)
+        ], dim=0).contiguous()
+        all_length[idx] = torch.stack(all_length[idx], dim=0).contiguous()
 
     batch = {
         "data": all_data,

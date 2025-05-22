@@ -61,6 +61,7 @@ class AlignBlock(nn.Module):
         super().__init__()
         self.pconv_mic = nn.Conv2d(in_channels_mic, hidden_channels, 1)
         self.pconv_ref = nn.Conv2d(in_channels_ref, hidden_channels, 1)
+        self.pconv_val = nn.Conv2d(in_channels_ref, hidden_channels, 1)
         self.unfold = nn.Sequential(nn.ZeroPad2d([0,0,delay-1,0]),
                                     nn.Unfold((delay, 1)))
         self.conv = nn.Sequential(nn.ZeroPad2d([1,1,4,0]),
@@ -80,7 +81,8 @@ class AlignBlock(nn.Module):
         V = self.conv(V)           # (B,1,T,D)
         A = torch.softmax(V, dim=-1)[..., None]  # (B,1,T,D,1)
         
-        y = self.unfold(x_ref).view(K.shape[0], K.shape[1], -1, K.shape[2], K.shape[3])\
+        Val = self.pconv_val(x_ref)
+        y = self.unfold(Val).view(K.shape[0], K.shape[1], -1, K.shape[2], K.shape[3])\
                 .permute(0,1,3,2,4).contiguous()  # (B,H,T,D,F)
         y = torch.sum(y * A, dim=-2)
         return y
@@ -145,9 +147,9 @@ class SubpixelConv2d(nn.Module):
     
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=(4,3), is_last=False):
+    def __init__(self, in_channels, out_channels, cache_channels, kernel_size=(4,3), is_last=False):
         super().__init__()
-        self.skip_conv = nn.Conv2d(in_channels, in_channels, 1)
+        self.skip_conv = nn.Conv2d(cache_channels, in_channels, 1)
         self.invresblock = InvertedResidualBlock(in_channels)
         self.deconv = SubpixelConv2d(in_channels, out_channels, kernel_size)
         self.bn = nn.BatchNorm2d(out_channels)
@@ -191,7 +193,8 @@ class CCM(nn.Module):
 class PersonalizedDeepVQE(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
-        self.fe = FE()
+        self.fe = FE(config.c)
+        assert len(config.enc.mic)+len(config.enc.mix) == len(config.dec)
 
         # mic signal
         self.enblocks_mic = []
@@ -210,7 +213,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
                 self.enblocks_ref.append(EncoderBlock(config.enc.ref[i-1], config.enc.ref[i]))
 
         # aligned far end signal
-        self.alignblock = AlignBlock(config.enc.mic[-1], config.enc.ref[-1], config.enc.mic[-1], config.delay)
+        self.alignblock = AlignBlock(config.enc.mic[-1], config.enc.ref[-1], config.enc.mic[-1], config.enc.delay)
 
         # combined signal
         self.enblocks_mix = []
@@ -221,13 +224,20 @@ class PersonalizedDeepVQE(pl.LightningModule):
                 self.enblocks_mix.append(EncoderBlock(config.enc.mix[i-1], config.enc.mix[i]))
         
         freq_dim = self._get_freq_dim(config.enc.n_fft, len(self.enblocks_mic)+len(self.enblocks_mix))
-        self.bottle = Bottleneck(config.enc.mix[-1]*freq_dim, 64*9)
+        self.bottle = Bottleneck(config.enc.mix[-1]*freq_dim, config.bottle_neck.dim)
         
-        self.deblock5 = DecoderBlock(128, 128)
-        self.deblock4 = DecoderBlock(128, 128)
-        self.deblock3 = DecoderBlock(128, 128)
-        self.deblock2 = DecoderBlock(128, 64)
-        self.deblock1 = DecoderBlock(64, 27)
+        # decoder
+        en_channels_reversed = list(config.enc.mic+config.enc.mix)[::-1]
+        self.deblocks = []
+        for i in range(len(config.dec)):
+            if i == 0:
+                self.deblocks.append(DecoderBlock(config.en.mix[-1], config.dec[i], en_channels_reversed[i]))
+            elif i == len(config.dec) - 1:
+                self.deblocks.append(DecoderBlock(config.dec[i-1], config.dec[i], en_channels_reversed[i], is_last=True))
+            else:
+                self.deblocks.append(DecoderBlock(config.dec[i-1], config.dec[i], en_channels_reversed[i]))
+
+        # ccm
         self.ccm = CCM()
 
     def _get_freq_dim(self, n_fft, times):
@@ -236,55 +246,57 @@ class PersonalizedDeepVQE(pl.LightningModule):
             freq_dim = (freq_dim - 3 + 2) // 2 +1
         return freq_dim
         
-    def forward(self, x_enr, x_mic, x_ref=None):
+    def forward(self, x_enr, x_mic_raw, x_ref=None):
         """x: (B,F,T,2)"""
+
+        x_enr = self.fe(x_enr)
+        x_mic = self.fe(x_mic)
         if x_ref is None:
             x_ref = torch.zeros_like(x_mic)
+        else:
+            x_ref = self.fe(x_ref)
+        tmp = torch.zeros_like(x_enr)
 
-        # enrollment signal
-        en_x0_enr = self.fe(x_enr)        # ; print(en_x0.shape)
-        en_x1_enr = self.enblock1_mic(en_x0_enr)  # ; print(en_x1.shape)
-        en_x2_enr = self.enblock2_mic(en_x1_enr)  # ; print(en_x2.shape)
+        # enrollment signal path
+        for block in self.enblocks_mic:
+            x_enr = block(x_enr)
 
-        x_enrr = torch.zeros_like(x_enr)
-        en_x0_enrr = self.fe(x_enrr)        # ; print(en_x0.shape)
-        en_x1_enrr = self.enblock1_mic(en_x0_enrr)  # ; print(en_x1.shape)
-        en_x2_enrr = self.enblock2_mic(en_x1_enrr)  # ; print(en_x2.shape)
+        for block in self.enblocks_ref:
+            tmp = block(tmp)
 
-        en_x2_e = self.alignblock(en_x2_enr, en_x2_enrr)
+        tmp = self.alignblock(x_enr, tmp)
+        x_enr = torch.concatenate([x_enr, tmp], dim=1).contiguous()
 
-        en_x3_e = self.enblock3(en_x2_e)  # ; print(en_x3.shape)
-        en_x4_e = self.enblock4(en_x3_e)  # ; print(en_x4.shape)
-        en_x5_e = self.enblock5(en_x4_e)  # ; print(en_x5.shape)
+        for block in self.enblocks_mix:
+            x_enr = block(x_enr)
 
-        # internal embedding
-        e = self.bottle(en_x5_e)
+        emb = self.bottle(x_enr)
 
-        # mic signal
-        en_x0_mic = self.fe(x_mic)        # ; print(en_x0.shape)
-        en_x1_mic = self.enblock1_mic(en_x0_mic)  # ; print(en_x1.shape)
-        en_x2_mic = self.enblock2_mic(en_x1_mic)  # ; print(en_x2.shape)
+        # mic signal path
+        enc_cache = [x_mic]
+        for block in self.enblocks_mic:
+            enc_cache.append(block(enc_cache[-1]))
 
-        # far end signal
-        en_x0_ref = self.fe(x_ref)        # ; print(en_x0.shape)
-        en_x1_ref = self.enblock1_ref(en_x0_ref)  # ; print(en_x1.shape)
-        en_x2_ref = self.enblock2_ref(en_x1_ref)  # ; print(en_x2.shape)
+        # ref signal path
+        for block in self.enblocks_ref:
+            x_ref = block(x_ref)
 
-        en_x2 = self.alignblock(en_x2_mic, en_x2_ref)
+        x_ref = self.alignblock(enc_cache[-1], x_ref)
 
-        en_x3 = self.enblock3(en_x2)  # ; print(en_x3.shape)
-        en_x4 = self.enblock4(en_x3)  # ; print(en_x4.shape)
-        en_x5 = self.enblock5(en_x4)  # ; print(en_x5.shape)
+        x_mix = torch.concatenate([enc_cache[-1], x_ref], dim=1).contiguous()
 
-        en_xr = self.bottle(en_x5, e)    # ; print(en_xr.shape)
-        
-        de_x5 = self.deblock5(en_xr, en_x5)[..., :en_x4.shape[-1]]  # ; print(de_x5.shape)
-        de_x4 = self.deblock4(de_x5, en_x4)[..., :en_x3.shape[-1]]  # ; print(de_x4.shape)
-        de_x3 = self.deblock3(de_x4, en_x3)[..., :en_x2.shape[-1]]  # ; print(de_x3.shape)
-        de_x2 = self.deblock2(de_x3, en_x2)[..., :en_x1_mic.shape[-1]]  # ; print(de_x2.shape)
-        de_x1 = self.deblock1(de_x2, en_x1_mic)[..., :en_x0_mic.shape[-1]]  # ; print(de_x1.shape)
-        
-        x_enh = self.ccm(de_x1, x_mic)  # (B,F,T,2)
+        for block in self.enblocks_mix:
+            x_mix = block(x_mix)
+            enc_cache.append(x_mix)
+
+        x_mix = self.bottle(x_mix, emb)
+        enc_cache = enc_cache[::-1]
+
+        # decoder
+        for idx in range(len(self.deblocks)):
+            x_mix = self.deblocks[idx](x_mix, enc_cache[idx])[..., :enc_cache[idx+1].shape[-1]]
+
+        x_enh = self.ccm(x_mix, x_mic_raw) # (B,F,T,2)
         
         return x_enh
     
