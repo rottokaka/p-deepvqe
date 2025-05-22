@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
 import numpy as np
 from einops import rearrange
 
@@ -15,6 +16,7 @@ class FE(nn.Module):
     def __init__(self, c=0.3):
         super().__init__()
         self.c = c
+
     def forward(self, x):
         """x: (B,F,T,2)"""
         x_mag = torch.sqrt(x[...,[0]]**2 + x[...,[1]]**2 + 1e-12)
@@ -29,6 +31,7 @@ class ResidualBlock(nn.Module):
         self.conv = nn.Conv2d(channels, channels, kernel_size=(4,3))
         self.bn = nn.BatchNorm2d(channels)
         self.elu = nn.ELU()
+
     def forward(self, x):
         """x: (B,C,T,F)"""
         y = self.elu(self.bn(self.conv(self.pad(x))))
@@ -46,23 +49,22 @@ class InvertedResidualBlock(nn.Module):
             nn.BatchNorm2d(channels//2),
             nn.Hardswish(),
             nn.Conv2d(channels//2, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-        )
+            nn.BatchNorm2d(channels))
 
     def forward(self, x):
+        """x: (B,C,T,F)"""
         return x + self.block(x)
         
 
 class AlignBlock(nn.Module):
-    def __init__(self, in_channels, hidden_channels, delay=100):
+    def __init__(self, in_channels_mic, in_channels_ref, hidden_channels, delay=100):
         super().__init__()
-        self.pconv_mic = nn.Conv2d(in_channels, hidden_channels, 1)
-        self.pconv_ref = nn.Conv2d(in_channels, hidden_channels, 1)
+        self.pconv_mic = nn.Conv2d(in_channels_mic, hidden_channels, 1)
+        self.pconv_ref = nn.Conv2d(in_channels_ref, hidden_channels, 1)
         self.unfold = nn.Sequential(nn.ZeroPad2d([0,0,delay-1,0]),
                                     nn.Unfold((delay, 1)))
         self.conv = nn.Sequential(nn.ZeroPad2d([1,1,4,0]),
                                   nn.Conv2d(hidden_channels, 1, (5,3)))
-        
         
     def forward(self, x_mic, x_ref):
         """
@@ -92,6 +94,7 @@ class EncoderBlock(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels)
         self.elu = nn.ELU()
         self.invresblock = InvertedResidualBlock(out_channels)
+
     def forward(self, x):
         return self.invresblock(self.elu(self.bn(self.conv(self.pad(x)))))
 
@@ -106,25 +109,27 @@ class Bottleneck(nn.Module):
         self.ln2 = nn.LayerNorm(hidden_size)
         self.fc1 = nn.Linear(input_size+hidden_size, input_size)
         self.fc2 = nn.Linear(hidden_size, input_size)
-        
+
     def forward(self, x, e = None):
         """x : (B,C,T,F)"""
         y = rearrange(x, 'b c t f -> b t (c f)')
         y = self.ln1(y)
+        is_first_pass = False
         if e == None:
+            is_first_pass = True
             e = torch.zeros(list(y.shape[:-1])+[self.hidden_size])
-        # print(y.shape, e.shape)
         y = torch.cat([y, e.expand(-1, y.shape[1], -1)], dim=-1)
         y = self.fc1(y)
         y = self.gru(y)[0]
         y = self.ln2(y)
 
-        # internal embedding
-        e = torch.mean(y, dim=1, keepdim=True)
-
+        if is_first_pass:
+            # internal embedding
+            e = torch.mean(y, dim=1, keepdim=True)
+            return e
         y = self.fc2(y)
         y = rearrange(y, 'b t (c f) -> b c t f', c=x.shape[1])
-        return e, y
+        return y
     
 
 class SubpixelConv2d(nn.Module):
@@ -143,14 +148,15 @@ class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=(4,3), is_last=False):
         super().__init__()
         self.skip_conv = nn.Conv2d(in_channels, in_channels, 1)
-        self.resblock = ResidualBlock(in_channels)
+        self.invresblock = InvertedResidualBlock(in_channels)
         self.deconv = SubpixelConv2d(in_channels, out_channels, kernel_size)
         self.bn = nn.BatchNorm2d(out_channels)
         self.elu = nn.ELU()
         self.is_last = is_last
+
     def forward(self, x, x_en):
         y = x + self.skip_conv(x_en)
-        y = self.deconv(self.resblock(y))
+        y = self.deconv(self.invresblock(y))
         if not self.is_last:
             y = self.elu(self.bn(y))
         return y
@@ -182,26 +188,40 @@ class CCM(nn.Module):
         return x_enh
 
 
-class PersonalizedDeepVQE(nn.Module):
-    def __init__(self):
+class PersonalizedDeepVQE(pl.LightningModule):
+    def __init__(self, config):
         super().__init__()
         self.fe = FE()
 
         # mic signal
-        self.enblock1_mic = EncoderBlock(2, 64)
-        self.enblock2_mic = EncoderBlock(64, 128)
+        self.enblocks_mic = []
+        for i in range(len(config.enc.mic)):
+            if i == 0:
+                self.enblocks_mic.append(EncoderBlock(2, config.enc.mic[i]))
+            else:
+                self.enblocks_mic.append(EncoderBlock(config.enc.mic[i-1], config.enc.mic[i]))
 
         # far end signal
-        self.enblock1_ref = EncoderBlock(2, 64)
-        self.enblock2_ref = EncoderBlock(64, 128)
+        self.enblocks_ref = []
+        for i in range(len(config.enc.ref)):
+            if i == 0:
+                self.enblocks_ref.append(EncoderBlock(2, config.enc.ref[i]))
+            else:
+                self.enblocks_ref.append(EncoderBlock(config.enc.ref[i-1], config.enc.ref[i]))
 
-        self.alignblock = AlignBlock(128, 128)
+        # aligned far end signal
+        self.alignblock = AlignBlock(config.enc.mic[-1], config.enc.ref[-1], config.enc.mic[-1], config.delay)
 
-        self.enblock3 = EncoderBlock(128, 128)
-        self.enblock4 = EncoderBlock(128, 128)
-        self.enblock5 = EncoderBlock(128, 128)
+        # combined signal
+        self.enblocks_mix = []
+        for i in range(len(config.enc.mix)):
+            if i == 0:
+                self.enblocks_mix.append(EncoderBlock(config.enc.mic[-1]*2, config.enc.mix[i]))
+            else:
+                self.enblocks_mix.append(EncoderBlock(config.enc.mix[i-1], config.enc.mix[i]))
         
-        self.bottle = Bottleneck(128*9, 64*9)
+        freq_dim = self._get_freq_dim(config.enc.n_fft, len(self.enblocks_mic)+len(self.enblocks_mix))
+        self.bottle = Bottleneck(config.enc.mix[-1]*freq_dim, 64*9)
         
         self.deblock5 = DecoderBlock(128, 128)
         self.deblock4 = DecoderBlock(128, 128)
@@ -209,6 +229,12 @@ class PersonalizedDeepVQE(nn.Module):
         self.deblock2 = DecoderBlock(128, 64)
         self.deblock1 = DecoderBlock(64, 27)
         self.ccm = CCM()
+
+    def _get_freq_dim(self, n_fft, times):
+        freq_dim = n_fft // 2 + 1
+        for i in range(times):
+            freq_dim = (freq_dim - 3 + 2) // 2 +1
+        return freq_dim
         
     def forward(self, x_enr, x_mic, x_ref=None):
         """x: (B,F,T,2)"""
@@ -231,8 +257,8 @@ class PersonalizedDeepVQE(nn.Module):
         en_x4_e = self.enblock4(en_x3_e)  # ; print(en_x4.shape)
         en_x5_e = self.enblock5(en_x4_e)  # ; print(en_x5.shape)
 
-        e, _ = self.bottle(en_x5_e)
-
+        # internal embedding
+        e = self.bottle(en_x5_e)
 
         # mic signal
         en_x0_mic = self.fe(x_mic)        # ; print(en_x0.shape)
@@ -250,7 +276,7 @@ class PersonalizedDeepVQE(nn.Module):
         en_x4 = self.enblock4(en_x3)  # ; print(en_x4.shape)
         en_x5 = self.enblock5(en_x4)  # ; print(en_x5.shape)
 
-        _, en_xr = self.bottle(en_x5, e)    # ; print(en_xr.shape)
+        en_xr = self.bottle(en_x5, e)    # ; print(en_xr.shape)
         
         de_x5 = self.deblock5(en_xr, en_x5)[..., :en_x4.shape[-1]]  # ; print(de_x5.shape)
         de_x4 = self.deblock4(de_x5, en_x4)[..., :en_x3.shape[-1]]  # ; print(de_x4.shape)
@@ -261,9 +287,12 @@ class PersonalizedDeepVQE(nn.Module):
         x_enh = self.ccm(de_x1, x_mic)  # (B,F,T,2)
         
         return x_enh
+    
+    def training_step(self, batch, batch_idx):
+        return
 
-def build(cfg):
-    pass
+def build_model(config):
+    return PersonalizedDeepVQE(config)
 
 def input_constructor(input_res):
     # input_res is just a placeholder, e.g., (3, 224, 224)
