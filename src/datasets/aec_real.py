@@ -1,10 +1,12 @@
 import torch
 import torchaudio
+import torch.nn as nn
 import torchaudio.functional as F
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import random
+import numpy as np
 
 class AECRealDataset(Dataset):
     def __init__(self, config, mode):
@@ -75,8 +77,8 @@ class AECRealDataset(Dataset):
         enrl_spec = self._apply_specaugment(enrl_spec)
 
         return {"data": [enrl_spec, mic_spec, farend_lpb_spec, target_spec],
-                "length": [torch.tensor([enrl_spec.shape[1]]), torch.tensor([mic_spec.shape[1]]), 
-                           torch.tensor([farend_lpb_spec.shape[1]]), torch.tensor([target_spec.shape[1]])]}
+                "length": [torch.tensor([enrl_spec.shape[2]]), torch.tensor([mic_spec.shape[2]]), 
+                           torch.tensor([farend_lpb_spec.shape[2]]), torch.tensor([target_spec.shape[2]])]}
     
     def _get_spec(self, signal):
         spec = self.transform(signal)
@@ -147,6 +149,8 @@ class AECRealModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
+            collate_fn=collate_fn,
+            worker_init_fn=worker_init_fn,
             batch_size=self.config.batch_size_per_gpu,
             num_workers=self.config.num_workers,
             shuffle=True,
@@ -155,6 +159,8 @@ class AECRealModule(pl.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
+            collate_fn=collate_fn,
+            worker_init_fn=worker_init_fn,
             batch_size=self.config.batch_size_per_gpu,
             num_workers=self.config.num_workers,
         )
@@ -162,6 +168,8 @@ class AECRealModule(pl.LightningDataModule):
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset,
+            collate_fn=collate_fn,
+            worker_init_fn=worker_init_fn,
             batch_size=self.config.batch_size_per_gpu,
             num_workers=self.config.num_workers,
         )
@@ -169,9 +177,40 @@ class AECRealModule(pl.LightningDataModule):
     def predict_dataloader(self):
         return DataLoader(
             self.predict_dataset,
+            collate_fn=collate_fn,
+            worker_init_fn=worker_init_fn,
             batch_size=self.config.batch_size_per_gpu,
             num_workers=self.config.num_workers,
         )
 
 def build_data_module(config):
     return AECRealModule(config)
+
+def collate_fn(batch):
+    all_data = [[], [], [], []] # enrl, mic, farend_lpb, target
+    all_length = [[], [], [], []]
+    for item in batch:
+        for idx in range((len(item["data"]))):
+            all_data[idx].append(item["data"][idx])
+        for idx in range((len(item["length"]))):
+            all_length[idx].append(item["length"][idx])
+
+    for idx in range(len(all_data)):
+        max_length = int(max(all_length[idx]))
+        all_data[idx] = torch.concatenate([
+            nn.functional.pad(t, (0, 0, max_length-t.shape[2], 0)) # t.shape = [B, F, T, 2]
+            for t in all_data[idx]
+        ], dim=0)
+        all_length[idx] = torch.stack(all_length[idx], dim=0)
+
+    batch = {
+        "data": all_data,
+        "length": all_length,
+    }
+
+    return batch
+
+def worker_init_fn(worker_id):
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
