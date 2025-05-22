@@ -231,7 +231,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
         self.deblocks = []
         for i in range(len(config.dec)):
             if i == 0:
-                self.deblocks.append(DecoderBlock(config.en.mix[-1], config.dec[i], en_channels_reversed[i]))
+                self.deblocks.append(DecoderBlock(config.enc.mix[-1], config.dec[i], en_channels_reversed[i]))
             elif i == len(config.dec) - 1:
                 self.deblocks.append(DecoderBlock(config.dec[i-1], config.dec[i], en_channels_reversed[i], is_last=True))
             else:
@@ -250,7 +250,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
         """x: (B,F,T,2)"""
 
         x_enr = self.fe(x_enr)
-        x_mic = self.fe(x_mic)
+        x_mic = self.fe(x_mic_raw)
         if x_ref is None:
             x_ref = torch.zeros_like(x_mic)
         else:
