@@ -19,13 +19,13 @@ class AECRealDataset(Dataset):
         super().__init__()
         self.config = config
         if mode == "train":
-            self.metadata = pd.read_csv(config.metadata_train)
+            self.metadata = pd.read_csv(config.metadata_train, delimiter="\t")
         elif mode == "val":
-            self.metadata = pd.read_csv(config.metadata_val)
+            self.metadata = pd.read_csv(config.metadata_val, delimiter="\t")
         elif mode == "test":
-            self.metadata = pd.read_csv(config.metadata_train)
+            self.metadata = pd.read_csv(config.metadata_train, delimiter="\t")
         elif mode == "infer":
-            self.metadata = pd.read_csv(config.metadata_train)
+            self.metadata = pd.read_csv(config.metadata_train, delimiter="\t")
         
         if config.feat.window_fn == "Hann":
             window_fn = torch.hann_window
@@ -46,7 +46,6 @@ class AECRealDataset(Dataset):
             n_freq_masks=self.config.augment.n_freq_masks,
             freq_mask_param=self.config.augment.freq_mask_param,
             p=self.config.augment.specaugment_rate,
-            mask_value=0.0,
         )
 
     def __len__(self):
@@ -75,11 +74,13 @@ class AECRealDataset(Dataset):
         target_spec = self._get_spec(target_sig)
         enrl_spec = self._apply_specaugment(enrl_spec)
 
-        return enrl_spec, mic_spec, farend_lpb_spec, target_spec
+        return {"data": [enrl_spec, mic_spec, farend_lpb_spec, target_spec],
+                "length": [torch.tensor([enrl_spec.shape[1]]), torch.tensor([mic_spec.shape[1]]), 
+                           torch.tensor([farend_lpb_spec.shape[1]]), torch.tensor([target_spec.shape[1]])]}
     
     def _get_spec(self, signal):
         spec = self.transform(signal)
-        return torch.stack(torch.stack([spec.real, spec.imag], dim=-1)).contiguous()
+        return torch.stack([spec.real, spec.imag], dim=-1).contiguous()
     
     def _pad(self, signal, padding_length, left_pad=True):
         pad = torch.zeros((signal.shape[0], padding_length))
@@ -106,7 +107,7 @@ class AECRealDataset(Dataset):
         return noisy_audio
             
     def _mix_signal(self, nearend, farend):
-        snr = random.randint(self.config.augment.min_snr, self.config.augment.max_snr)
+        snr = torch.tensor([random.randint(self.config.augment.min_snr, self.config.augment.max_snr)])
         if nearend.shape[1] > farend.shape[1]:
             farend = self._pad(farend, nearend.shape[1]-farend.shape[1], False)
             mic = F.add_noise(nearend, farend, snr)
