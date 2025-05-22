@@ -9,6 +9,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import numpy as np
 from einops import rearrange
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class FE(nn.Module):
@@ -112,7 +113,7 @@ class Bottleneck(nn.Module):
         self.fc1 = nn.Linear(input_size+hidden_size, input_size)
         self.fc2 = nn.Linear(hidden_size, input_size)
 
-    def forward(self, x, e = None):
+    def forward(self, x, lengths, e = None):
         """x : (B,C,T,F)"""
         y = rearrange(x, 'b c t f -> b t (c f)')
         y = self.ln1(y)
@@ -120,15 +121,21 @@ class Bottleneck(nn.Module):
         if e == None:
             is_first_pass = True
             e = torch.zeros(list(y.shape[:-1])+[self.hidden_size])
+            e = e.to(y.device)
         y = torch.cat([y, e.expand(-1, y.shape[1], -1)], dim=-1)
         y = self.fc1(y)
+        y = pack_padded_sequence(y, lengths.squeeze(1), batch_first=True, enforce_sorted=False)
         y = self.gru(y)[0]
+        y, _ = pad_packed_sequence(y, batch_first=True)
         y = self.ln2(y)
 
         if is_first_pass:
             # internal embedding
-            e = torch.mean(y, dim=1, keepdim=True)
-            return e
+            e = torch.zeros((y.shape[0], y.shape[2]), dtype=torch.float, device=y.device)
+            for i in range(e.shape[0]):
+                e[i] = torch.mean(y[0, :lengths[i]], dim=0)
+            # e = torch.mean(y, dim=1, keepdim=True)
+            return e.unsqueeze(1)
         y = self.fc2(y)
         y = rearrange(y, 'b t (c f) -> b c t f', c=x.shape[1])
         return y
@@ -193,11 +200,13 @@ class CCM(nn.Module):
 class PersonalizedDeepVQE(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
+        self.loss_fn = ComplexCompressedMSELoss(config.loss_func)
+        config = config.arch
         self.fe = FE(config.c)
         assert len(config.enc.mic)+len(config.enc.mix) == len(config.dec)
 
         # mic signal
-        self.enblocks_mic = []
+        self.enblocks_mic = nn.ModuleList()
         for i in range(len(config.enc.mic)):
             if i == 0:
                 self.enblocks_mic.append(EncoderBlock(2, config.enc.mic[i]))
@@ -205,7 +214,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
                 self.enblocks_mic.append(EncoderBlock(config.enc.mic[i-1], config.enc.mic[i]))
 
         # far end signal
-        self.enblocks_ref = []
+        self.enblocks_ref = nn.ModuleList()
         for i in range(len(config.enc.ref)):
             if i == 0:
                 self.enblocks_ref.append(EncoderBlock(2, config.enc.ref[i]))
@@ -216,7 +225,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
         self.alignblock = AlignBlock(config.enc.mic[-1], config.enc.ref[-1], config.enc.mic[-1], config.enc.delay)
 
         # combined signal
-        self.enblocks_mix = []
+        self.enblocks_mix = nn.ModuleList()
         for i in range(len(config.enc.mix)):
             if i == 0:
                 self.enblocks_mix.append(EncoderBlock(config.enc.mic[-1]*2, config.enc.mix[i]))
@@ -228,7 +237,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
         
         # decoder
         en_channels_reversed = list(config.enc.mic+config.enc.mix)[::-1]
-        self.deblocks = []
+        self.deblocks = nn.ModuleList()
         for i in range(len(config.dec)):
             if i == 0:
                 self.deblocks.append(DecoderBlock(config.enc.mix[-1], config.dec[i], en_channels_reversed[i]))
@@ -246,7 +255,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
             freq_dim = (freq_dim - 3 + 2) // 2 +1
         return freq_dim
         
-    def forward(self, x_enr, x_mic_raw, x_ref=None):
+    def forward(self, x_enr, x_enr_length, x_mic_raw, x_mic_raw_length, x_ref=None):
         """x: (B,F,T,2)"""
 
         x_enr = self.fe(x_enr)
@@ -270,7 +279,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
         for block in self.enblocks_mix:
             x_enr = block(x_enr)
 
-        emb = self.bottle(x_enr)
+        emb = self.bottle(x_enr, x_enr_length)
 
         # mic signal path
         enc_cache = [x_mic]
@@ -289,7 +298,7 @@ class PersonalizedDeepVQE(pl.LightningModule):
             x_mix = block(x_mix)
             enc_cache.append(x_mix)
 
-        x_mix = self.bottle(x_mix, emb)
+        x_mix = self.bottle(x_mix, x_mic_raw_length, emb)
         enc_cache = enc_cache[::-1]
 
         # decoder
@@ -301,7 +310,39 @@ class PersonalizedDeepVQE(pl.LightningModule):
         return x_enh
     
     def training_step(self, batch, batch_idx):
-        return
+        enrl, mic, farend_lpb, target = batch["data"]
+        enrl_length, mic_length, farend_lpb_length, target_length = batch["length"]
+        pred = self(enrl, enrl_length, mic, mic_length, farend_lpb)
+        mask = torch.arange(mic.shape[2])[None, :].to(mic.device) < mic_length[:, None]
+        mask = mask[..., None]
+        mask.to(enrl.device)
+        pred = pred * mask
+        loss = self.loss_fn(pred, target)
+        return loss
+    
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-4)
+    
+class ComplexCompressedMSELoss(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.compress = FE(config.c)
+        self.beta = config.beta
+
+    def _magnitude_missmatch(self, pred, target):
+        pred_mag = torch.sqrt(pred[..., 0]**2+pred[..., 1]**2)
+        target_mag = torch.sqrt(target[..., 0]**2+target[..., 1]**2)
+        return torch.mean((pred_mag-target_mag)**2)
+
+    def _phase_missmatch(self, pred, target):
+        return torch.mean((pred[..., 0]-target[..., 0])**2+(pred[..., 1]-target[..., 1])**2)
+
+    def forward(self, pred, target):
+        """pred: (B,F,T,2)"""
+        pred = self.compress(pred)
+        target = self.compress(target)
+        loss = self._magnitude_missmatch(pred, target)+self.beta*self._phase_missmatch(pred, target)
+        return loss
 
 def build_model(config):
     return PersonalizedDeepVQE(config)

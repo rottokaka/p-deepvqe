@@ -4,12 +4,12 @@ hydra:
 
 datasets:
   name: AEC  # dataset name
-  metadata_train: null
-  metadata_val: null
-  metadata_test: null
-  metadata_infer: null
-  batch_size_per_gpu: 64
-  num_workers: 32
+  metadata_train: data/AEC-Challenge/datasets/train_metadata.tsv
+  metadata_val: data/AEC-Challenge/datasets/train_metadata.tsv
+  metadata_test: data/AEC-Challenge/datasets/train_metadata.tsv
+  metadata_infer: data/AEC-Challenge/datasets/train_metadata.tsv
+  batch_size_per_gpu: 2
+  num_workers: 2
   augment:
     max_snr: 15 # highest SNR when mixing near end and far end signal
     min_snr: -5 # lowest SNR when mixing near end and far end signal
@@ -28,7 +28,6 @@ datasets:
     win_length: 320
     n_fft: 480
     window_fn: Hann # Hann | Hamming
-    c: 0.3 # compression exponent
 
 optim:
   epochs: 20
@@ -40,9 +39,8 @@ optim:
 model:
   name: PVQE_S
   arch:
+    c: 0.3 # compression exponent
     enc:
-      kernel_size: [4, 3]
-
       # number of filter in each branch
       mic: [16, 40] # mic branch
       ref: [8, 24]  # far end branch
@@ -53,7 +51,7 @@ model:
       n_fft: 480 # number of frequency bin
 
     bottle_neck:
-      dim: 256 # hidden dimension of temporal block (GRU)
+      dim: 32 # hidden dimension of temporal block (GRU)
 
     dec: [40, 32, 32, 27] # number of filter in the inverted residual blocks
 

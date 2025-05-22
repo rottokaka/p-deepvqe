@@ -139,7 +139,7 @@ class AECRealModule(pl.LightningDataModule):
         super().__init__()
         self.config = config
     
-    def setup(self):
+    def setup(self, stage):
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None

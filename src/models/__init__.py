@@ -1,3 +1,1 @@
-from .deepvqe import DeepVQE
-from .deepvqe_v1 import DeepVQE as DEEPVQEV1
-
+from .personalized_deepvqe import build_model
