@@ -8,20 +8,20 @@ datasets:
   metadata_val: data/AEC-Challenge/datasets/train_metadata.tsv
   metadata_test: data/AEC-Challenge/datasets/train_metadata.tsv
   metadata_infer: data/AEC-Challenge/datasets/train_metadata.tsv
-  batch_size_per_gpu: 2
-  num_workers: 2
+  batch_size_per_gpu: 1
+  num_workers: 0
+  edge_smoothing: true
   augment:
     max_snr: 15 # highest SNR when mixing near end and far end signal
     min_snr: -5 # lowest SNR when mixing near end and far end signal
     white_noise_rate: 0.1
     max_aug_snr: 20
-    min_aug_snr: 3
+    min_aug_snr: 10
     specaugment_rate: 0.15 # only apply on enrollment audio
     n_time_masks: 2
     time_mask_param: 10
     n_freq_masks: 2
     freq_mask_param: 25
-    
   feat:
     target_sample_rate: 16000
     hop_length: 160
@@ -41,20 +41,14 @@ model:
   arch:
     c: 0.3 # compression exponent
     enc:
-      # number of filter in each branch
       mic: [16, 40] # mic branch
       ref: [8, 24]  # far end branch
       mix: [56, 24] # combined branch
-
       delay: 100 # maximum echo delay in the alignment block
-      
       n_fft: 480 # number of frequency bin
-
     bottle_neck:
       dim: 32 # hidden dimension of temporal block (GRU)
-
     dec: [40, 32, 32, 27] # number of filter in the inverted residual blocks
-
   loss_func:
     c: 0.3 # should be equal as above
     beta: 0.7

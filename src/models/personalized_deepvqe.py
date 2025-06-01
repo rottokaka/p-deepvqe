@@ -10,7 +10,7 @@ import pytorch_lightning as pl
 import numpy as np
 from einops import rearrange
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
+import torchaudio
 
 class FE(nn.Module):
     """Feature extraction"""
@@ -43,13 +43,13 @@ class InvertedResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(channels, channels//2, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels//2),
+            nn.Conv2d(channels, channels*2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels*2),
             nn.ZeroPad2d([1, 1, 3, 0]),
-            nn.Conv2d(channels//2, channels//2, kernel_size=(4,3)),
-            nn.BatchNorm2d(channels//2),
-            nn.Hardswish(),
-            nn.Conv2d(channels//2, channels, kernel_size=1, bias=False),
+            nn.Conv2d(channels*2, channels*2, kernel_size=(4,3)),
+            nn.BatchNorm2d(channels*2),
+            nn.ELU(),
+            nn.Conv2d(channels*2, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels))
 
     def forward(self, x):
@@ -113,7 +113,7 @@ class Bottleneck(nn.Module):
         self.fc1 = nn.Linear(input_size+hidden_size, input_size)
         self.fc2 = nn.Linear(hidden_size, input_size)
 
-    def forward(self, x, lengths, e = None):
+    def forward(self, x, lengths, e=None):
         """x : (B,C,T,F)"""
         y = rearrange(x, 'b c t f -> b t (c f)')
         y = self.ln1(y)
@@ -182,7 +182,8 @@ class CCM(nn.Module):
     def forward(self, m, x):
         """
         m: (B,27,T,F)
-        x: (B,F,T,2)"""
+        x: (B,F,T,2)
+        """
         m = rearrange(m, 'b (r c) t f -> b r c t f', r=3)
         H = torch.sum(self.v.to(m.device)[None,:,None,None,None] * m, dim=1)  # (B,C/3,T,F), complex
         M = rearrange(H, 'b (m n) t f -> b m n t f', m=3)  # (B,m,n,T,F), complex
@@ -257,7 +258,6 @@ class PersonalizedDeepVQE(pl.LightningModule):
         
     def forward(self, x_enr, x_enr_length, x_mic_raw, x_mic_raw_length, x_ref=None):
         """x: (B,F,T,2)"""
-
         x_enr = self.fe(x_enr)
         x_mic = self.fe(x_mic_raw)
         if x_ref is None:
@@ -269,16 +269,12 @@ class PersonalizedDeepVQE(pl.LightningModule):
         # enrollment signal path
         for block in self.enblocks_mic:
             x_enr = block(x_enr)
-
         for block in self.enblocks_ref:
             tmp = block(tmp)
-
         tmp = self.alignblock(x_enr, tmp)
         x_enr = torch.concatenate([x_enr, tmp], dim=1).contiguous()
-
         for block in self.enblocks_mix:
             x_enr = block(x_enr)
-
         emb = self.bottle(x_enr, x_enr_length)
 
         # mic signal path
@@ -289,15 +285,11 @@ class PersonalizedDeepVQE(pl.LightningModule):
         # ref signal path
         for block in self.enblocks_ref:
             x_ref = block(x_ref)
-
         x_ref = self.alignblock(enc_cache[-1], x_ref)
-
         x_mix = torch.concatenate([enc_cache[-1], x_ref], dim=1).contiguous()
-
         for block in self.enblocks_mix:
             x_mix = block(x_mix)
             enc_cache.append(x_mix)
-
         x_mix = self.bottle(x_mix, x_mic_raw_length, emb)
         enc_cache = enc_cache[::-1]
 
@@ -306,22 +298,42 @@ class PersonalizedDeepVQE(pl.LightningModule):
             x_mix = self.deblocks[idx](x_mix, enc_cache[idx])[..., :enc_cache[idx+1].shape[-1]]
 
         x_enh = self.ccm(x_mix, x_mic_raw) # (B,F,T,2)
-        
         return x_enh
     
     def training_step(self, batch, batch_idx):
         enrl, mic, farend_lpb, target = batch["data"]
         enrl_length, mic_length, farend_lpb_length, target_length = batch["length"]
         pred = self(enrl, enrl_length, mic, mic_length, farend_lpb)
-        mask = torch.arange(mic.shape[2])[None, :].to(mic.device) < mic_length[:, None]
-        mask = mask[..., None]
-        mask.to(enrl.device)
-        pred = pred * mask
+        # mask = torch.arange(mic.shape[2])[None, :].to(mic.device) < mic_length[:, None]
+        # mask = mask[..., None]
+        # mask.to(enrl.device)
+        # pred = pred * mask
         loss = self.loss_fn(pred, target)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        if self.current_epoch % 100 == 0:
+            mic_sig = self._get_waveform(mic.clone().detach())
+            farend_lpb_sig = self._get_waveform(farend_lpb.clone().detach())
+            target_sig = self._get_waveform(target.clone().detach())
+            pred_sig = self._get_waveform(pred.clone().detach())
+            torchaudio.save(f"D:/RTV/PersonalizedDeepVQE/outputs/{self.current_epoch}_{batch_idx}_mic_{loss}.wav", mic_sig, 16000, bits_per_sample=16)
+            torchaudio.save(f"D:/RTV/PersonalizedDeepVQE/outputs/{self.current_epoch}_{batch_idx}_ref_{loss}.wav", farend_lpb_sig, 16000, bits_per_sample=16)
+            torchaudio.save(f"D:/RTV/PersonalizedDeepVQE/outputs/{self.current_epoch}_{batch_idx}_target_{loss}.wav", target_sig, 16000, bits_per_sample=16)
+            torchaudio.save(f"D:/RTV/PersonalizedDeepVQE/outputs/{self.current_epoch}_{batch_idx}_pred_{loss}.wav", pred_sig, 16000, bits_per_sample=16)
         return loss
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=1e-4)
+        return torch.optim.Adam(self.parameters(), lr=6e-4, weight_decay=1e-7)
+    
+    def _get_waveform(self, spec):
+        transform = torchaudio.transforms.InverseSpectrogram(
+            n_fft=480,
+            hop_length=160,
+            win_length=320,
+            window_fn=torch.hann_window,
+        )
+        spec = torch.complex(spec[..., 0], spec[..., 1]).contiguous().cpu()
+        # print(spec.shape)
+        return transform(spec)
     
 class ComplexCompressedMSELoss(nn.Module):
     def __init__(self, config):
@@ -332,47 +344,67 @@ class ComplexCompressedMSELoss(nn.Module):
     def _magnitude_missmatch(self, pred, target):
         pred_mag = torch.sqrt(pred[..., 0]**2+pred[..., 1]**2)
         target_mag = torch.sqrt(target[..., 0]**2+target[..., 1]**2)
-        return torch.mean((pred_mag-target_mag)**2)
+        return torch.sum((pred_mag-target_mag)**2)
 
     def _phase_missmatch(self, pred, target):
-        return torch.mean((pred[..., 0]-target[..., 0])**2+(pred[..., 1]-target[..., 1])**2)
+        return torch.sum((pred[..., 0]-target[..., 0])**2+(pred[..., 1]-target[..., 1])**2)
 
     def forward(self, pred, target):
         """pred: (B,F,T,2)"""
-        pred = self.compress(pred)
-        target = self.compress(target)
-        loss = self._magnitude_missmatch(pred, target)+self.beta*self._phase_missmatch(pred, target)
-        return loss
+        # pred = self.compress(pred)
+        # target = self.compress(target)
+        # loss = self._magnitude_missmatch(pred, target)+self.beta*self._phase_missmatch(pred, target)
+        # return loss/pred.shape[0]/pred.shape[2]
+        pred = torch.complex(pred[..., 0], pred[..., 1]).contiguous()
+        target = torch.complex(target[..., 0], target[..., 1]).contiguous()
+        return loss_function(pred, target, self.beta)
+
+def power_law_compress(S, power=0.3, epsilon=1e-8):
+    """
+    Apply power-law compression to the STFT magnitude while preserving phase.
+    
+    Args:
+        S (torch.Tensor): Complex STFT tensor of shape [batch, time, freq]
+        power (float): Power for compression, default is 0.3
+        epsilon (float): Small value to avoid division by zero
+    
+    Returns:
+        S_pow (torch.Tensor): Compressed complex STFT
+        mag_pow (torch.Tensor): Compressed magnitude
+    """
+    mag = torch.abs(S)
+    mag_safe = mag + epsilon
+    mag_pow = mag ** power
+    S_pow = (mag_pow / mag_safe) * S
+    return S_pow, mag_pow
+
+def loss_function(S_enhanced, S_clean, lambda_val=0.113):
+    """
+    Compute the loss function between enhanced and clean STFTs.
+    
+    Args:
+        S_enhanced (torch.Tensor): Enhanced STFT, shape [batch, time, freq], complex
+        S_clean (torch.Tensor): Clean STFT, shape [batch, time, freq], complex
+        lambda_val (float): Weight for the complex difference term, default is 0.113
+    
+    Returns:
+        torch.Tensor: Loss value, averaged over the batch
+    """
+    # Compress both enhanced and clean STFTs
+    S_enhanced_pow, mag_enhanced_pow = power_law_compress(S_enhanced)
+    S_clean_pow, mag_clean_pow = power_law_compress(S_clean)
+    
+    # Magnitude difference loss
+    mag_diff = mag_enhanced_pow - mag_clean_pow
+    mag_loss = torch.sum(mag_diff ** 2, dim=[1, 2])  # Sum over time and freq
+    
+    # Complex difference loss
+    complex_diff = S_enhanced_pow - S_clean_pow
+    complex_loss = torch.sum(complex_diff.real ** 2 + complex_diff.imag ** 2, dim=[1, 2])
+    
+    # Total loss, averaged over batch
+    total_loss = mag_loss + lambda_val * complex_loss
+    return total_loss.mean()
 
 def build_model(config):
     return PersonalizedDeepVQE(config)
-
-def input_constructor(input_res):
-    # input_res is just a placeholder, e.g., (3, 224, 224)
-    x1 = torch.randn(1, 257, 100, 2)
-    x2 = torch.randn(1, 257, 100, 2)  # e.g., an auxiliary vector input
-    x3 = torch.randn(1, 257, 80, 2)
-    return dict(x_mic=x1, x_ref=x2, x_enr=x3)  # or return (x1, x2) depending on model
-
-if __name__ == "__main__":
-    model = PersonalizedDeepVQE().eval()
-    x = torch.randn(1, 257, 63, 2)
-    y = model(x, x)
-
-    
-    from ptflops import get_model_complexity_info
-    flops, params = get_model_complexity_info(model, (257, 63, 2), as_strings=True,
-                                           input_constructor=input_constructor,
-                                           print_per_layer_stat=False, verbose=True)
-    print(flops, params)
-
-    """causality check"""
-    a = torch.randn(1, 257, 100, 2)
-    b = torch.randn(1, 257, 100, 2)
-    c = torch.randn(1, 257, 100, 2)
-    x1 = torch.cat([a, b], dim=2)
-    x2 = torch.cat([a, c], dim=2)
-    y1 = model(x1, x2)
-    y2 = model(x2, x1)
-    print((y1[:,:,:100,:] - y2[:,:,:100,:]).abs().max())
-    print((y1[:,:,100:,:] - y2[:,:,100:,:]).abs().max())

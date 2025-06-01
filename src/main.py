@@ -4,6 +4,12 @@ from omegaconf import OmegaConf
 from models import build_model
 from datasets import build_data_module
 import pytorch_lightning as pl
+import os
+
+# Move temporary compilation files to another drive
+os.environ["TORCH_EXTENSIONS_DIR"] = "D:/torch_extensions"
+os.environ["TORCH_HOME"] = "D:/torch_cache"
+os.environ["TMPDIR"] = "D:/tmp"
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +21,7 @@ def my_hydra_app(cfg):
     # datamodule.setup()
     # train_dataloader = datamodule.train_dataloader()
     model = build_model(cfg.model)
-    trainer = pl.Trainer(accelerator="gpu", min_epochs=1, max_epochs=3)
+    trainer = pl.Trainer(accelerator="gpu", min_epochs=1, max_epochs=1000)
     trainer.fit(model, datamodule)
     # for idx, batch in enumerate(train_dataloader):
     #     enrl, mic, farend_lpb, target = batch["data"]

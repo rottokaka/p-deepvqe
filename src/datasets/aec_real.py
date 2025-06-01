@@ -65,6 +65,12 @@ class AECRealDataset(Dataset):
         nearend_mic_sig, nearend_mic_sr = torchaudio.load(self.metadata.iloc[index, 2])
         assert enrl_sr == nearend_mic_sr == farend_mic_sr == farend_lpb_sr == self.config.feat.target_sample_rate
 
+        if self.config.edge_smoothing:
+            farend_mic_sig = self._apply_window_edges(farend_mic_sig[:, :farend_mic_sig.shape[1]//5])
+            farend_lpb_sig = self._apply_window_edges(farend_lpb_sig[:, :farend_lpb_sig.shape[1]//5])
+            enrl_sig = self._apply_window_edges(enrl_sig[:, enrl_sig.shape[1]//5:enrl_sig.shape[1]//3])
+            nearend_mic_sig = self._apply_window_edges(nearend_mic_sig[:, :nearend_mic_sig.shape[1]//5])
+
         mic_sig, target_sig = self._mix_signal(nearend_mic_sig, farend_mic_sig)
 
         diff = mic_sig.shape[1]-farend_lpb_sig.shape[1]
@@ -99,12 +105,6 @@ class AECRealDataset(Dataset):
             return torch.concatenate((signal, pad), dim=1)
         
     def _add_white_noise(self, signal):
-        # signal_power = signal.pow(2).mean()
-        # snr = random.randint(self.config.min_aug_snr, self.config.max_aug_snr)
-        # snr_power = 10 ** (snr / 10)
-        # noise_power = signal_power / snr_power
-        # noise = torch.randn_like(signal) * torch.sqrt(noise_power)
-        # return signal + noise
         snr = random.randint(self.config.augment.min_aug_snr, self.config.augment.max_aug_snr)
         noise = torch.rand_like(signal) - 0.5
         audio_rms = signal.norm(p=2)
@@ -116,15 +116,18 @@ class AECRealDataset(Dataset):
         return noisy_audio
             
     def _mix_signal(self, nearend, farend):
+        # snr = torch.tensor([5]) # torch.tensor([random.randint(self.config.augment.min_snr, self.config.augment.max_snr)])
         snr = torch.tensor([random.randint(self.config.augment.min_snr, self.config.augment.max_snr)])
         if nearend.shape[1] > farend.shape[1]:
-            farend = self._pad(farend, nearend.shape[1]-farend.shape[1], False)
-            mic = F.add_noise(nearend, farend, snr)
+            farend = self._pad(farend, nearend.shape[1]-farend.shape[1], False)            
         else:
             start_sample = random.randint(0, farend.shape[1]-nearend.shape[1])
             nearend = self._pad(nearend, farend.shape[1]-nearend.shape[1]-start_sample, False)
             nearend = self._pad(nearend, start_sample)
+        if torch.any(farend != 0):
             mic = F.add_noise(nearend, farend, snr)
+        else:
+            mic = nearend
         return mic, nearend
     
     def _apply_specaugment(self, spec):
@@ -133,6 +136,18 @@ class AECRealDataset(Dataset):
         spec[..., 0] *= mask
         spec[..., 0] *= mask
         return spec
+    
+    def _apply_window_edges(self, sig, fade_length=160):
+        sig = sig.squeeze(0)
+        assert fade_length * 2 <= sig.shape[0]
+        window = torch.hann_window(fade_length * 2)
+        fade_in = window[:fade_length]
+        fade_out = window[fade_length:]
+        sig = sig.clone()
+        sig[:fade_length] *= fade_in
+        sig[-fade_length:] *= fade_out
+        return sig.unsqueeze(0)
+
 
 class AECRealModule(pl.LightningDataModule):
     def __init__(self, config):
